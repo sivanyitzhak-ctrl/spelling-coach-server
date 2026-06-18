@@ -1,7 +1,16 @@
 from flask import Flask, request, jsonify
 import re
+import os
+from twilio.rest import Client
 
 app = Flask(__name__)
+
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_FROM = "whatsapp:+14155238886"
+CHILD_WHATSAPP = os.environ.get("CHILD_WHATSAPP")
+
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 SPELLING_MISTAKES = {
     "בצפר": ("בית ספר", "כותבים 'בית ספר' — שתי מילים נפרדות!"),
@@ -14,7 +23,6 @@ SPELLING_MISTAKES = {
 def check_text(text):
     words = text.strip().split()
     
-    # בדיקת תבנית "אני י..."
     for i, word in enumerate(words):
         if word == "אני" and i + 1 < len(words):
             next_word = re.sub(r'[^\u05d0-\u05ea]', '', words[i + 1])
@@ -22,7 +30,6 @@ def check_text(text):
                 corrected = "א" + next_word[1:]
                 return f"אני {next_word}", f"אני {corrected}", f"כותבים 'אני {corrected}' ולא 'אני {next_word}'!"
     
-    # בדיקת שגיאות כתיב
     for word in words:
         clean = re.sub(r'[^\u05d0-\u05ea]', '', word)
         if clean in SPELLING_MISTAKES:
@@ -30,6 +37,13 @@ def check_text(text):
             return clean, correct, tip
     
     return None, None, None
+
+def send_whatsapp(message):
+    client.messages.create(
+        from_=TWILIO_WHATSAPP_FROM,
+        to=CHILD_WHATSAPP,
+        body=message
+    )
 
 @app.route('/check', methods=['POST'])
 def check():
@@ -43,6 +57,8 @@ def check():
 
     if wrong:
         print(f"Mistake found: {wrong} -> {correct}: {tip}")
+        message = f"✏️ שגיאת כתיב!\n{tip}\n⭐ נסי לכתוב את המילה הנכונה 3 פעמים!"
+        send_whatsapp(message)
         return jsonify({
             "status": "mistake",
             "wrong": wrong,
