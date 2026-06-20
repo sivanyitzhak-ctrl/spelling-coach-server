@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify
 import re
 import os
+import json
+import requests
 from datetime import datetime
 from twilio.rest import Client
 
@@ -9,6 +11,9 @@ app = Flask(__name__)
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = "whatsapp:+14155238886"
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -25,6 +30,19 @@ SPELLING_MISTAKES = {
 }
 
 daily_mistakes = {}
+
+DAY_OPENERS = {
+    # weekday(): 0=Monday ... 6=Sunday in Python. We map explicitly by Hebrew day.
+    6: "היי, כאן לקסי.\nהיו לך כמה שגיאות כתיב בהודעות היום. שווה לתקן אותן זריז כדי שמחר הכל יראה אש! 🔥",  # ראשון
+    0: "היי, לקסי כאן.\nאספתי את טעויות הכתיב מההודעות שלך היום. הנה התיקונים המדויקים, כמה שניות וזה מאחורינו. ⚡",  # שני
+    1: "כאן לקסי.\nהגיע הזמן לסגור פינה על שגיאות הכתיב שהיו היום. הנה הגרסה הנכונה: 💬",  # שלישי
+    2: "מה הולך? לקסי על הקו.\nיש כמה שגיאות כתיב בהודעות מהיום. בואו ננעל את התיקונים ונמשיך. 🧼",  # רביעי
+    3: "היי, כאן לקסי.\nהנה רשימת התיקונים לשגיאות הכתיב מהיום. מעבר זריז על הטיפים וזה סגור: 👑",  # חמישי
+    4: "סוף שבוע מרגיע, לקסי כאן.\nאלו שגיאות הכתיב שעלו היום. סוגרים את התיקונים זריז והנקודות אצלך בחשבון. 📱",  # שישי
+    5: "שבוע טוב! לקסי כאן.\nזמן לתקן את טעויות הכתיב של היום. מעבר על הטיפים, וישר לאתגר. 🧠",  # שבת
+}
+
+NO_MISTAKES_MESSAGE = "🌟 כל הכבוד! היום כתבת בלי אף שגיאה אחת!\nתמשיכי ככה, את מדהימה! 💪"
 
 
 def check_text(text):
@@ -54,15 +72,83 @@ def send_whatsapp(to_number, message):
     )
 
 
-def build_summary_message(mistakes):
-    if not mistakes:
-        return "🌟 כל הכבוד! היום כתבת בלי אף שגיאה אחת!\nתמשיכי ככה, את מדהימה! 💪"
+def build_lexi_prompt(unique_mistakes, opener):
+    """
+    בונה את ה-prompt שנשלח ל-Claude כדי לייצר את גוף ההודעה (טיפים + אתגר).
+    unique_mistakes: list of dicts {wrong, correct}
+    """
+    mistakes_list = "\n".join(
+        f"- מילה שגויה: \"{m['wrong']}\" | מילה תקינה: \"{m['correct']}\""
+        for m in unique_mistakes
+    )
 
-    lines = ["📚 סיכום היום שלך:"]
-    for i, m in enumerate(mistakes, start=1):
-        lines.append(f"{i}. {m['wrong']} ← {m['correct']}")
-    lines.append("\nכל הכבוד שאת מתאמנת! 🌟")
-    return "\n".join(lines)
+    prompt = f"""את/ה לקסי, עוזר/ת כתיב לילדים ובני נוער. כתוב/כתבי בלשון א-מגדרית בלבד (ניטרלית, ללא פנייה ספציפית לבן/בת), בטון ישיר וקליל אך לא מתיילד.
+
+הנה רשימת השגיאות שהילד/ה כתב/ה היום:
+{mistakes_list}
+
+המשימה שלך:
+
+1. עבור כל מילה שגויה ברשימה, כתוב/כתבי בלוק בפורמט הבא בדיוק:
+🎯 **המילה התקינה** (ולא המילה השגויה)
+💎 טיפ: הסבר קצר המבוסס אך ורק על שורש או משפחת מילים בעברית (לדוגמה: "שייכת למשפחת ה-X" או "מאותו שורש כמו Y"). הטיפ חייב להיות מדויק לשונית ואמיתי, לא מומצא.
+
+אחרי כל בלוק (כולל האחרון) — שורת רווח ריקה מלאה.
+
+2. בסוף, תחת הכותרת "🏆 אתגר 50 הנקודות:", כתוב/כתבי את המשפט:
+"פשוט להקליד לי את המשפט הבא נכון והנקודות אצלך:"
+ואז משפט אחד קצר, הגיוני וטבעי בעברית שמשלב בתוכו את כל המילים התקינות (לא את השגויות) מהרשימה, כשכל מילה תקינה מודגשת ב-**. המשפט חייב להישמע טבעי, לא מאולץ.
+
+החזר/החזירי אך ורק את הטקסט הסופי המוכן לשליחה (בלי הקדמות, בלי הסברים, בלי markdown fences) - מתחיל ישירות מהבלוק הראשון (🎯) ומסתיים במשפט האתגר.
+"""
+    return prompt
+
+
+def call_claude(prompt):
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 1000,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    response = requests.post(ANTHROPIC_API_URL, headers=headers, json=body, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    text_blocks = [block["text"] for block in data["content"] if block["type"] == "text"]
+    return "".join(text_blocks).strip()
+
+
+def build_summary_message(mistakes):
+    today_weekday = datetime.now().weekday()  # Monday=0 ... Sunday=6 (Python)
+    # ממירים לפי המיפוי שלנו (שמבוסס על ה-index של Python: 0=שני...6=ראשון)
+    opener = DAY_OPENERS.get(today_weekday, DAY_OPENERS[0])
+
+    if not mistakes:
+        return f"{opener}\n\n{NO_MISTAKES_MESSAGE}"
+
+    # איחוד שגיאות זהות
+    unique = {}
+    for m in mistakes:
+        key = (m['wrong'], m['correct'])
+        if key not in unique:
+            unique[key] = True
+    unique_mistakes = [{"wrong": w, "correct": c} for (w, c) in unique.keys()]
+
+    prompt = build_lexi_prompt(unique_mistakes, opener)
+
+    try:
+        lexi_body = call_claude(prompt)
+    except Exception as e:
+        print(f"Claude API error: {e}")
+        # Fallback - הודעה בסיסית בלי AI אם הקריאה נכשלת
+        lines = [f"🎯 {m['correct']} (ולא {m['wrong']})" for m in unique_mistakes]
+        lexi_body = "\n\n".join(lines)
+
+    return f"{opener}\n\n{lexi_body}"
 
 
 @app.route('/check', methods=['POST'])
